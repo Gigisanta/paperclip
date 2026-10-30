@@ -630,6 +630,18 @@ When newer source activity restores a valid live or waiting path, the recovery a
 
 Plain comments alone do not make a recovery action stale. A comment can provide evidence, but the recovery action should remain visible when the source issue is still stalled and the comment does not create a valid action-path primitive such as a wake, monitor, interaction, approval, blocker, human owner, execution participant, terminal disposition, or delegated follow-up.
 
+#### Same-source legacy execution reconciliation
+
+The existing board-only execution reconciliation in `POST /api/issues/:id/recovery-actions/resolve` can address any legacy action for the same source run, including an older resolved no-replay hold. Resolution and delivery use the existing issue-row admission lock to inspect and lock all same-source actions. Company, issue, source run, return owner, recorded decisions, and continuation owner must agree. Conflicting evidence returns a conflict without authorizing another continuation; retained workspace-repair obligations remain separate.
+
+An existing reconciliation intent becomes canonical. Superseded siblings remain auditable with their original evidence and archived no-replay hold in `supersededExecutionRecovery`; active siblings pass through the normal resolution lifecycle. The canonical action records the linked action IDs, source run, stable delivery key, and adopted receipt in `executionConsolidation`. `GET /api/issues/:id/recovery-actions` exposes this history, including resolved legacy holds and superseded siblings.
+
+Legacy reconciliation delivery uses `execution-reconciliation:<companyId>:<issueId>:<sourceRunId>`, not an action-ID key. Existing action-ID pending or skipped wake receipts are adopted, and redundant receipts are retained as superseded rather than dispatched. An already-admitted successor is adopted even after it finishes, with `retryOfRunId` identifying the source. Repeated or concurrent resolutions and delivery sweeps cannot admit a second successor for that source. Later terminalization preserves an existing resolved no-replay action instead of opening a duplicate incident.
+
+Delivery acknowledgement takes the same issue, recovery-action, then successor lock order as resolution and admission. Suppression release after an actual claim also locks the issue before updating its successor and wake, so a task drain racing acknowledgement requeues the same admitted turn without a lock inversion or another wake. Adopting an existing successor validates the stopped source and recorded decision independently of permission to start a new turn: repeating the decision after the issue becomes `done` or `cancelled` must preserve that terminal state and cannot request another wake. A retained workspace repair remains evidence-only and records `continuationDelivery: not_requested`.
+
+This is consolidation of one observed execution decision, not permission to retry unknown effects. Other source runs, owners, workspace holds, and ordinary dispatch gates remain independent. No separate endpoint or UI Retry action is required.
+
 ### Agent-assigned `todo`
 
 This is dispatch state: ready to start, not yet actively claimed.

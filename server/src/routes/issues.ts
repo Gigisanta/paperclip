@@ -36,7 +36,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
-import { and, asc, desc, eq, inArray, isNull, notInArray, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import type { ChatChannelService } from "../services/chat-channels.js";
 import {
@@ -9492,8 +9492,14 @@ export function issueRoutes(
     });
     const retainedHolds = await db.select().from(issueRecoveryActions).where(and(
       eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
-      sql`${issueRecoveryActions.evidence}->'workspaceRestoreRecovery'->>'schema' = ${LEGACY_WORKSPACE_RECOVERY_SCHEMA}`,
-      sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+      or(and(
+        sql`${issueRecoveryActions.evidence}->'workspaceRestoreRecovery'->>'schema' = ${LEGACY_WORKSPACE_RECOVERY_SCHEMA}`,
+        sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+      ), and(eq(issueRecoveryActions.cause, "legacy_execution_requires_reconciliation"), or(
+        sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+        sql`${issueRecoveryActions.evidence} ? 'executionReconciliation'`,
+        sql`${issueRecoveryActions.evidence} ? 'supersededExecutionRecovery'`,
+      ))),
     )).orderBy(desc(issueRecoveryActions.createdAt));
     res.json({
       active,
@@ -9629,6 +9635,7 @@ export function issueRoutes(
           return { issue: lockedIssue, recoveryAction, chatRetry: null, workspaceRepairOnly: true };
         }
 
+        let reconciledAction: typeof issueRecoveryActions.$inferSelect | null = null;
         let activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(
           lockedIssue.companyId,
           lockedIssue.id,
@@ -9658,7 +9665,20 @@ export function issueRoutes(
             );
             const automatic = settled.evidence.automaticRecovery as
               { replay?: string } | undefined;
-            if (automatic?.replay === "blocked" && executionReconciliation) {
+            if (settled.cause === "legacy_execution_requires_reconciliation" && executionReconciliation) {
+              assertBoard(req);
+              if (outcome !== "restored" || sourceIssueStatus !== "todo" ||
+                  (activeRecoveryAction && (activeRecoveryAction.cause !== settled.cause ||
+                    activeRecoveryAction.fingerprint !== settled.fingerprint))) {
+                throw conflict("Reconcile this source without replacing another recovery or changing its continuation owner.");
+              }
+              reconciledAction = await markExecutionReconciliation(tx as unknown as Db, settled,
+                executionReconciliation, actor.actorId);
+              if (["delivered", "delegated"].includes(String(reconciledAction.evidence.continuationDelivery))) {
+                return { issue: lockedIssue, recoveryAction: reconciledAction, replayed: true };
+              }
+              activeRecoveryAction = issueRecoveryActionReadModel(reconciledAction);
+            } else if (automatic?.replay === "blocked" && executionReconciliation) {
               // An automatic no-replay disposition is final until new evidence
               // arrives. Keep the supported evidence API usable without a dialog.
               assertBoard(req);
@@ -9688,7 +9708,7 @@ export function issueRoutes(
         }
         if (
           !activeRecoveryAction ||
-          (actionId && activeRecoveryAction.id !== actionId)
+          (actionId && activeRecoveryAction.id !== actionId && !reconciledAction)
         ) {
           throw notFound("Active recovery action not found");
         }
@@ -9878,10 +9898,10 @@ export function issueRoutes(
           }
         }
 
-        if (executionReconciliation) {
+        if (executionReconciliation && !reconciledAction) {
           // The authorized chat retry is the sole durable delivery owner.
           // Never also enqueue a generic successor that lacks chat provenance.
-          await markExecutionReconciliation(
+          reconciledAction = await markExecutionReconciliation(
             tx as unknown as Db,
             activeRecoveryAction,
             executionReconciliation,
@@ -10038,11 +10058,18 @@ export function issueRoutes(
               ? "owner_completed"
               : outcome;
 
-        const recoveryAction = await recoveryActionsSvc.resolveActiveForIssue(
+        const recoveryAction = reconciledAction && !["active", "escalated"].includes(reconciledAction.status)
+          ? issueRecoveryActionReadModel((await tx.update(issueRecoveryActions).set({
+              status: actionStatus, outcome: recordedOutcome, resolutionNote: resolutionNote ?? null,
+              resolvedAt: reconciledAction.resolvedAt ?? new Date(), updatedAt: new Date(),
+            }).where(and(eq(issueRecoveryActions.companyId, existing.companyId),
+              eq(issueRecoveryActions.sourceIssueId, existing.id), eq(issueRecoveryActions.id, reconciledAction.id)))
+              .returning())[0]!)
+          : await recoveryActionsSvc.resolveActiveForIssue(
           {
             companyId: existing.companyId,
             sourceIssueId: existing.id,
-            actionId: activeRecoveryAction.id,
+            actionId: reconciledAction?.id ?? activeRecoveryAction.id,
             status: actionStatus,
             outcome: recordedOutcome,
             resolutionNote: resolutionNote ?? null,

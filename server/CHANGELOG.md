@@ -5,6 +5,9 @@
 ### Patch Changes
 
 - Bound full-tree workspace Git scans with process-wide concurrency, queue, timeout, cancellation, coalescing, and short-lived changed-file caching. Saturated or timed-out changed-file requests now return a retryable degraded response, and hidden file-browser panels no longer initiate scans.
+- Consolidate legacy execution recovery actions for the same source run under the existing issue admission lock. Preserve superseded evidence, migrate historical wake receipts to source-run idempotency, adopt an admitted successor, and expose the consolidated history through the recovery API without clearing unrelated holds.
+- Serialize reconciliation acknowledgement through the same issue/action/successor lock order, adopt an admitted successor after task completion without reopening it, and retain the evidence-only workspace-repair contract.
+- Keep task-drain claim release issue-first, matching reconciliation admission and acknowledgement so concurrent delivery cannot strand the admitted successor through a row-lock inversion.
 
 ## 0.3.1
 

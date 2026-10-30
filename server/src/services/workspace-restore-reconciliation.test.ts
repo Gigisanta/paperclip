@@ -109,15 +109,15 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
   it("clears the replay hold only after validated repair is recorded, preserving the source and recovery evidence", async () => {
     const f = await seed();
     await db.update(heartbeatRuns).set({ processPid: process.pid }).where(eq(heartbeatRuns.id, f.sourceRunId));
-    const repaired = await validateExecutionReconciliation({ db, ...f });
+    const repaired = await validateExecutionReconciliation({ db, ...f, workspaceRepairOnly: true });
     expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toMatchObject({ recoveryActionId: f.actionId });
     const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.actionId));
-    await markExecutionReconciliation(db, action, f.decision, "board");
+    await markExecutionReconciliation(db, action, f.decision, "board", undefined, { workspaceRepairOnly: true });
     expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
     const [recorded] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.actionId));
     expect(recorded.evidence).toMatchObject({ workspaceRestoreRecovery: repaired.resultJson!.workspaceRestoreRecovery,
       executionReconciliation: { runId: f.sourceRunId, workspaceRepairEvidence: f.decision.workspaceRepairEvidence },
-      continuationDelivery: "pending" });
+      continuationDelivery: "not_requested" });
     const [source] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId));
     expect(source).toMatchObject({ status: "released", leasePolicy: "retain_on_failure",
       metadata: { remoteExecutionTermination: { state: "stopped" } } });
