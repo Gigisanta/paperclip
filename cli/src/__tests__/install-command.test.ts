@@ -27,6 +27,12 @@ import {
 import { resolveCliVersion } from "../version.js";
 import { systemdServiceName } from "../services/service-manager.js";
 
+// Uninstall must never reach the host launchd/systemd domain from tests.
+const noInstalledService = vi.fn(async () => ({
+  supported: true as const,
+  manager: { status: vi.fn(async () => ({ installed: false, active: false })) } as never,
+}));
+
 const ORIGINAL_ENV = { ...process.env };
 
 describe("managed install commands", () => {
@@ -408,7 +414,7 @@ describe("managed install commands", () => {
     fs.mkdirSync(paths.cliRoot, { recursive: true });
     fs.writeFileSync(unrelatedFile, "keep");
 
-    await expect(uninstallCommand()).rejects.toThrow("unverified install store");
+    await expect(uninstallCommand({ detectServiceManager: noInstalledService })).rejects.toThrow("unverified install store");
     expect(fs.readFileSync(unrelatedFile, "utf8")).toBe("keep");
   });
 
@@ -430,7 +436,7 @@ describe("managed install commands", () => {
 
     await withInstallStoreLock(
       async () => {
-        await expect(uninstallCommand()).rejects.toThrow("already running");
+        await expect(uninstallCommand({ detectServiceManager: noInstalledService })).rejects.toThrow("already running");
       },
       paths,
     );
