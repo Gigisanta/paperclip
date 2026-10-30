@@ -282,14 +282,15 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
     await runCommand("bash", ["scripts/prepare-server-ui-dist.sh"], { cwd: checkoutPath, env: buildEnv({ PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" }), maxBuffer: 32 * 1024 * 1024 });
     const metadata = JSON.parse(fs.readFileSync(path.join(checkoutPath, "cli", "package.json"), "utf8")) as { version: string };
     const workspacePackages = resolveGitInstallWorkspacePackages(checkoutPath);
+    // Same packages that scripts/release.sh fills with the shared runtime skills; other packages own their skills.
+    for (const skillsPackageDir of ["server", "packages/adapters/claude-local", "packages/adapters/codex-local"]) {
+      const skillsDir = path.join(checkoutPath, skillsPackageDir, "skills");
+      fs.rmSync(skillsDir, { recursive: true, force: true });
+      fs.cpSync(path.join(checkoutPath, "skills"), skillsDir, { recursive: true });
+    }
     for (const [index, workspacePackage] of workspacePackages.entries()) {
       const packageDir = path.join(checkoutPath, workspacePackage.dir);
-      const packageJson = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8")) as { files?: string[]; bundleDependencies?: string[]; bundledDependencies?: string[] };
-      if (packageJson.files?.includes("skills")) {
-        const skillsDir = path.join(packageDir, "skills");
-        fs.rmSync(skillsDir, { recursive: true, force: true });
-        fs.cpSync(path.join(checkoutPath, "skills"), skillsDir, { recursive: true });
-      }
+      const packageJson = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8")) as { bundleDependencies?: string[]; bundledDependencies?: string[] };
       const bundledDependencies = packageJson.bundleDependencies ?? packageJson.bundledDependencies ?? [];
       if (bundledDependencies.length > 0) {
         const stagedPackage = path.join(stagingRoot, `workspace-package-${index}`);
