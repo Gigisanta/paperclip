@@ -160,7 +160,9 @@ Review and trust the repository and ref: installing a git ref executes that
 revision's package installation and release build scripts on your machine.
 
 Git builds prepare the production board UI and shared runtime skills in the
-downloaded checkout before packaging bundled dependencies. Build output from a
+downloaded checkout before packaging bundled dependencies. Staged bundles skip
+pack lifecycle scripts, matching the release pipeline; their checkout-relative
+prepack scripts cannot run from the staging directory. Build output from a
 separate local checkout is not used. A failed build leaves the current managed
 payload selected.
 

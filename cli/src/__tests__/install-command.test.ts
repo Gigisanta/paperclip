@@ -33,7 +33,7 @@ describe("managed install commands", () => {
   let root: string;
 
   beforeEach(() => {
-    root = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-install-command-"));
+    root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-install-command-")));
     process.env = {
       ...ORIGINAL_ENV,
       HOME: path.join(root, "home"),
@@ -181,6 +181,9 @@ describe("managed install commands", () => {
     const runtimeDir = path.join(root, "fixture-runtime");
     fs.mkdirSync(runtimeDir);
     fs.writeFileSync(path.join(runtimeDir, "package.json"), JSON.stringify({ name: "fixture-runtime", version: "1.0.0" }));
+    await runCommandWithDiagnostics("npm", ["pack", runtimeDir, "--pack-destination", root, "--ignore-scripts"], {
+      env: process.env,
+    });
     let stagedServer: { indexHtml: string; skillMarkdown: string; bundledRuntime: string } | undefined;
     const runCommand: CommandRunner = async (file, args, options) => {
       if (file === "tar") {
@@ -191,7 +194,8 @@ describe("managed install commands", () => {
         const serverManifest = JSON.parse(fs.readFileSync(serverManifestPath, "utf8"));
         serverManifest.files = ["dist", "ui-dist", "skills"];
         serverManifest.bundleDependencies = ["fixture-runtime"];
-        serverManifest.dependencies["fixture-runtime"] = `file:${runtimeDir}`;
+        serverManifest.dependencies["fixture-runtime"] = `file:${path.join(root, "fixture-runtime-1.0.0.tgz")}`;
+        serverManifest.scripts = { prepack: "bash ../scripts/prepare-server-ui-dist.sh" };
         fs.writeFileSync(serverManifestPath, JSON.stringify(serverManifest));
         fs.mkdirSync(path.join(checkout, "server", "dist"));
         fs.writeFileSync(path.join(checkout, "server", "dist", "index.js"), "export {};\n");
@@ -218,14 +222,13 @@ describe("managed install commands", () => {
         const packageDir = args[1];
         const manifest = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8"));
         if (manifest.name === "@paperclipai/server") {
+          const result = await runCommandWithDiagnostics(file, args, options);
           stagedServer = {
             indexHtml: fs.readFileSync(path.join(packageDir, "ui-dist", "index.html"), "utf8"),
             skillMarkdown: fs.readFileSync(path.join(packageDir, "skills", "paperclip", "SKILL.md"), "utf8"),
             bundledRuntime: JSON.parse(fs.readFileSync(path.join(packageDir, "node_modules", "fixture-runtime", "package.json"), "utf8")).name,
           };
-          const destination = args[args.indexOf("--pack-destination") + 1];
-          fs.writeFileSync(path.join(destination, "paperclipai-server-0.3.1.tgz"), "package");
-          return { stdout: "", stderr: "" };
+          return result;
         }
       }
       return fixtureCommand(file, args, options);
