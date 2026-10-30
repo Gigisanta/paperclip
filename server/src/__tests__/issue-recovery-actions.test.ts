@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { once } from "node:events";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -32,6 +33,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
+import { actorMiddleware } from "../middleware/auth.js";
 import { issueRoutes } from "../routes/issues.js";
 import { buildPaperclipWakePayload, heartbeatService } from "../services/heartbeat.js";
 import { deliverReconciledExecutions } from "../services/execution-recovery-resolution.js";
@@ -41,6 +43,8 @@ import { recoveryService } from "../services/recovery/service.js";
 import { noticeMetadataReferencesRecoveryAction } from "../services/recovery/successful-run-handoff.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { terminalizeLegacyExecution } from "../services/legacy-execution-recovery.js";
+import { createLocalDiskStorageProvider } from "../storage/local-disk-provider.js";
+import { createStorageService } from "../storage/service.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -2071,6 +2075,60 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     await terminalizeLegacyExecution({ db, run: run!, status: "failed" });
     expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.sourceIssueId)))
       .toMatchObject([{ id: f.blocked.id, status: "resolved", evidence: { automaticRecovery: { replay: "blocked" } } }]);
+  });
+
+  it("smokes same-run consolidation over loopback HTTP with native board authentication and PostgreSQL", async () => {
+    const f = await seedDuplicateLegacyDelivery();
+    const app = express();
+    app.use(express.json());
+    app.use(actorMiddleware(db, { deploymentMode: "local_trusted" }));
+    const storage = createStorageService(createLocalDiskStorageProvider(path.join(operationLogRoot, "http-smoke-storage")));
+    app.use("/api", issueRoutes(db, storage));
+    app.use(errorHandler);
+    const server = app.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("Missing disposable HTTP listener address");
+      const base = `http://127.0.0.1:${address.port}/api/issues/${f.sourceIssueId}`;
+      const resolve = async (actionId: string) => {
+        const response = await fetch(`${base}/recovery-actions/resolve`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ...f.body, actionId }),
+        });
+        const body: unknown = await response.json();
+        expect(response.status, JSON.stringify(body)).toBe(200);
+        return body;
+      };
+      await Promise.all([f.action.id, f.blocked.id].map(resolve));
+      await Promise.all([1, 2].map(() => deliverReconciledExecutions(db, f.heartbeat.wakeup)));
+      const repeated = await resolve(f.blocked.id);
+      await deliverReconciledExecutions(db, f.heartbeat.wakeup);
+      const successors = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, f.previousRunId));
+      const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+      expect(successors).toHaveLength(1);
+      expect(successors[0]).toMatchObject({ status: "queued", agentId: f.coderId });
+      expect(wakes).toHaveLength(1);
+      expect(wakes[0]).toMatchObject({ runId: successors[0]!.id,
+        idempotencyKey: `execution-reconciliation:${f.companyId}:${f.sourceIssueId}:${f.previousRunId}` });
+      expect(repeated).toMatchObject({ recoveryAction: { evidence: { continuationDelivery: "delivered",
+        continuationRunId: successors[0]!.id,
+        executionConsolidation: { canonicalActionId: f.action.id, wakeRequestId: wakes[0]!.id } } } });
+      expect(await getExecutionBlocker(db, f.companyId, f.sourceIssueId)).toBeNull();
+      const historyResponse = await fetch(`${base}/recovery-actions`);
+      expect(historyResponse.status).toBe(200);
+      const history: unknown = await historyResponse.json();
+      expect(history).toMatchObject({ active: null, actions: expect.arrayContaining([
+        expect.objectContaining({ id: f.blocked.id, evidence: expect.objectContaining({
+          supersededExecutionRecovery: expect.objectContaining({ canonicalActionId: f.action.id,
+            automaticRecovery: expect.objectContaining({ replay: "blocked" }) }),
+        }) }),
+      ]) });
+    } finally {
+      const closed = once(server, "close");
+      server.close();
+      await closed;
+    }
   });
 
   it("delivers a reconciled execution once across concurrent sweeps without a deferred duplicate", async () => {
