@@ -159,6 +159,11 @@ Git-ref installs resolve the requested ref to an exact commit before building.
 Review and trust the repository and ref: installing a git ref executes that
 revision's package installation and release build scripts on your machine.
 
+Git builds prepare the production board UI and shared runtime skills in the
+downloaded checkout before packaging bundled dependencies. Build output from a
+separate local checkout is not used. A failed build leaves the current managed
+payload selected.
+
 When replacing an existing managed installation with `install --repo ... --ref <full-commit-sha> --yes`, take an explicit `paperclipai db:backup --dir <backup-directory> --filename-prefix before-pinned-install --json` first. Unlike `update`, `install` does not back up the database or restart the running service. Preserve `~/.paperclip/cli/install.json` and its previous payload, quiesce execution before switching, and use the service commands below to activate the reviewed payload. `paperclipai update --rollback --yes --json` selects the previous retained payload; it does not restore database contents or reverse migrations.
 
 ## Onboarding And The Service

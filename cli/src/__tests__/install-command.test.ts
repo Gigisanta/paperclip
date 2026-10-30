@@ -168,6 +168,74 @@ describe("managed install commands", () => {
     expect(installCall?.[1].filter((arg) => arg.endsWith(".tgz"))).toHaveLength(4);
   });
 
+  it("prepares bundled server UI and runtime skills before staging its declared files", async () => {
+    process.env.PATH = ORIGINAL_ENV.PATH;
+    process.env.npm_config_cache = path.join(root, "npm-cache");
+    process.env.npm_config_userconfig = path.join(root, "npmrc");
+    process.env.npm_config_offline = "true";
+    const sha = "e".repeat(40);
+    const fixtureCommand = createGitCheckoutRunCommand(sha);
+    const scriptsRoot = path.resolve(import.meta.dirname, "../../../scripts");
+    const indexHtml = "<html><body>Built UI fixture</body></html>\n";
+    const skillMarkdown = "# Runtime skill fixture\n";
+    const runtimeDir = path.join(root, "fixture-runtime");
+    fs.mkdirSync(runtimeDir);
+    fs.writeFileSync(path.join(runtimeDir, "package.json"), JSON.stringify({ name: "fixture-runtime", version: "1.0.0" }));
+    let stagedServer: { indexHtml: string; skillMarkdown: string; bundledRuntime: string } | undefined;
+    const runCommand: CommandRunner = async (file, args, options) => {
+      if (file === "tar") {
+        const result = await fixtureCommand(file, args, options);
+        const checkout = args[args.indexOf("-C") + 1];
+        fs.writeFileSync(path.join(checkout, "package.json"), "{}");
+        const serverManifestPath = path.join(checkout, "server", "package.json");
+        const serverManifest = JSON.parse(fs.readFileSync(serverManifestPath, "utf8"));
+        serverManifest.files = ["dist", "ui-dist", "skills"];
+        serverManifest.bundleDependencies = ["fixture-runtime"];
+        serverManifest.dependencies["fixture-runtime"] = `file:${runtimeDir}`;
+        fs.writeFileSync(serverManifestPath, JSON.stringify(serverManifest));
+        fs.mkdirSync(path.join(checkout, "server", "dist"));
+        fs.writeFileSync(path.join(checkout, "server", "dist", "index.js"), "export {};\n");
+        fs.mkdirSync(path.join(checkout, "ui", "dist"), { recursive: true });
+        fs.writeFileSync(path.join(checkout, "ui", "dist", "index.html"), indexHtml);
+        fs.mkdirSync(path.join(checkout, "skills", "paperclip"), { recursive: true });
+        fs.writeFileSync(path.join(checkout, "skills", "paperclip", "SKILL.md"), skillMarkdown);
+        fs.copyFileSync(
+          path.join(scriptsRoot, "prepare-server-ui-dist.sh"),
+          path.join(checkout, "scripts", "prepare-server-ui-dist.sh"),
+        );
+        return result;
+      }
+      if (file === "bash" && args[0] === "scripts/prepare-server-ui-dist.sh") {
+        return runCommandWithDiagnostics(file, args, options);
+      }
+      if (file === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs") && path.basename(args[1]) === "server") {
+        return runCommandWithDiagnostics(file, [
+          path.join(scriptsRoot, "prepare-bundled-package.mjs"),
+          ...args.slice(1),
+        ], options);
+      }
+      if (file === "npm" && args[0] === "pack" && args[1]?.includes("workspace-package-")) {
+        const packageDir = args[1];
+        const manifest = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8"));
+        if (manifest.name === "@paperclipai/server") {
+          stagedServer = {
+            indexHtml: fs.readFileSync(path.join(packageDir, "ui-dist", "index.html"), "utf8"),
+            skillMarkdown: fs.readFileSync(path.join(packageDir, "skills", "paperclip", "SKILL.md"), "utf8"),
+            bundledRuntime: JSON.parse(fs.readFileSync(path.join(packageDir, "node_modules", "fixture-runtime", "package.json"), "utf8")).name,
+          };
+          const destination = args[args.indexOf("--pack-destination") + 1];
+          fs.writeFileSync(path.join(destination, "paperclipai-server-0.3.1.tgz"), "package");
+          return { stdout: "", stderr: "" };
+        }
+      }
+      return fixtureCommand(file, args, options);
+    };
+
+    await installGitPayload("paperclipai/paperclip", sha, runCommand, resolveInstallStorePaths());
+
+    expect(stagedServer).toEqual({ indexHtml, skillMarkdown, bundledRuntime: "fixture-runtime" });
+  });
+
   it("builds git checkouts with NODE_ENV cleared so ambient production mode keeps devDependencies", async () => {
     process.env.NODE_ENV = "production";
     const sha = "d".repeat(40);
@@ -178,7 +246,7 @@ describe("managed install commands", () => {
       file === "corepack" ||
       (file === "npm" && args[0] === "pack") ||
       (file === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs")));
-    expect(buildCalls).toHaveLength(9);
+    expect(buildCalls).toHaveLength(10);
     for (const call of buildCalls) {
       const env = call[2]?.env;
       expect(env, `${call[0]} ${call[1].join(" ")} must run with an explicit env`).toBeDefined();
