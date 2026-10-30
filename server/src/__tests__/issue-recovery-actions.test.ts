@@ -1937,15 +1937,21 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         executionReconciliation: canonical!.evidence.executionReconciliation } };
   }
 
-  it.each(["skipped", "pending", "finished_successor"] as const)(
+  it.each(["skipped", "skipped_source_key", "pending", "duplicate_wakes", "active_sibling", "finished_successor", "context_successor"] as const)(
     "consolidates same-run legacy holds through HTTP and delivers one successor (%s)",
     async (migration) => {
       const f = await seedDuplicateLegacyDelivery();
       const oldKey = `execution-reconciliation:${f.action.id}`;
+      const skipped = migration === "skipped" || migration === "skipped_source_key";
       let admittedRunId: string | null = null;
-      if (migration === "finished_successor") {
+      if (migration === "active_sibling") {
+        await db.update(issueRecoveryActions).set({ status: "active", outcome: null, resolvedAt: null })
+          .where(eq(issueRecoveryActions.id, f.blocked.id));
+      }
+      if (migration === "finished_successor" || migration === "context_successor") {
         const [run] = await db.insert(heartbeatRuns).values({
-          companyId: f.companyId, agentId: f.coderId, status: "succeeded", retryOfRunId: f.previousRunId,
+          companyId: f.companyId, agentId: f.coderId, status: "succeeded",
+          retryOfRunId: migration === "context_successor" ? null : f.previousRunId,
           contextSnapshot: { issueId: f.sourceIssueId, recoveryActionId: f.blocked.id,
             previousRunId: f.previousRunId, retryOfRunId: f.previousRunId, source: "execution.reconciled" },
         }).returning();
@@ -1953,15 +1959,25 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       }
       const [oldWake] = await db.insert(agentWakeupRequests).values({
         companyId: f.companyId, agentId: f.coderId, source: "automation", triggerDetail: "system",
-        reason: migration === "skipped" ? "execution_reconciliation_required" : "issue_recovery_action_restored",
-        status: migration === "skipped" ? "skipped" : admittedRunId ? "dispatched" : "queued",
+        reason: skipped ? "execution_reconciliation_required" : "issue_recovery_action_restored",
+        status: skipped ? "skipped" : admittedRunId ? "dispatched" : "queued",
         runId: admittedRunId, requestedByActorType: "system", requestedByActorId: "execution-recovery",
-        idempotencyKey: migration === "skipped" ? `execution-wait:${randomUUID()}` : oldKey,
+        idempotencyKey: skipped ? `execution-wait:${randomUUID()}` : oldKey,
         payload: { issueId: f.sourceIssueId, recoveryActionId: f.action.id,
           _paperclipWakeContext: { issueId: f.sourceIssueId, previousRunId: f.previousRunId },
-          ...(migration === "skipped" ? { executionWait: { recoveryActionId: f.blocked.id,
-            requestedIdempotencyKey: oldKey } } : {}) },
+          ...(skipped ? { executionWait: { recoveryActionId: f.blocked.id,
+            requestedIdempotencyKey: migration === "skipped_source_key"
+              ? `execution-reconciliation:${f.companyId}:${f.sourceIssueId}:${f.previousRunId}` : oldKey } } : {}) },
       }).returning();
+      if (migration === "duplicate_wakes") {
+        await db.insert(agentWakeupRequests).values({
+          companyId: f.companyId, agentId: f.coderId, source: "automation", triggerDetail: "system",
+          reason: "issue_recovery_action_restored", status: "queued",
+          requestedByActorType: "system", requestedByActorId: "execution-recovery",
+          idempotencyKey: `execution-reconciliation:${f.blocked.id}`,
+          payload: { issueId: f.sourceIssueId, recoveryActionId: f.blocked.id },
+        });
+      }
       const app = createApp();
       const responses = await Promise.all([f.action.id, f.blocked.id].map(actionId =>
         request(app).post(`/api/issues/${f.sourceIssueId}/recovery-actions/resolve`).send({ ...f.body, actionId })));
@@ -1988,6 +2004,9 @@ describeEmbeddedPostgres("issue recovery actions", () => {
           automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } } } });
       expect(superseded.evidence.automaticRecovery).toBeUndefined();
       for (const response of responses) expect(response.body.recoveryAction.evidence.executionConsolidation).toBeDefined();
+      const history = await request(app).get(`/api/issues/${f.sourceIssueId}/recovery-actions`).expect(200);
+      expect(history.body.active).toBeNull();
+      expect(history.body.actions.map((row: { id: string }) => row.id).sort()).toEqual([f.action.id, f.blocked.id].sort());
       const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.previousRunId));
       await terminalizeLegacyExecution({ db, run: source!, status: "failed" });
       expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.sourceIssueId))).toHaveLength(2);
@@ -2011,6 +2030,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     await deliverReconciledExecutions(db, f.heartbeat.wakeup);
     expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.sourceIssueId))).toEqual(before);
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, f.previousRunId))).toHaveLength(0);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toHaveLength(0);
   });
 
   it("does not consolidate or clear a different source run on the same issue", async () => {

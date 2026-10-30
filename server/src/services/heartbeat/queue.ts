@@ -17,6 +17,7 @@ import {
   compareCents,
   hasWorkspaceRestoreFailure,
 } from "@paperclipai/shared";
+import type { ExecutionReconciliation } from "@paperclipai/shared";
 import { nonIdleSlackIssueCondition } from "../slack-conversation-state.js";
 import { readQueuedInteractionResponse } from "../queued-interaction-response.js";
 import {
@@ -33,6 +34,7 @@ import { canRetryStoppedRun } from "../cancelled-native-startup.js";
 import { getExecutionBlocker } from "../execution-blocker.js";
 import { isConversationAdapter } from "../conversation-continuation.js";
 import { recordExecutionWait } from "../execution-wait.js";
+import { markExecutionReconciliation } from "../execution-recovery-resolution.js";
 import {
   getNativeReviewAssignment,
   readNativeReviewAssignmentContext,
@@ -2977,9 +2979,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           }
 
           let reconciledSourceRunId: string | null = null;
+          let reconciledWakeRequestId: string | null = null;
           let reconciledRestoreRetryCount: number | null = null;
           if (executionReconciliationWake) {
-            const actionId = readNonEmptyString(
+            let actionId = readNonEmptyString(
               enrichedContextSnapshot.recoveryActionId,
             );
             if (
@@ -2990,7 +2993,6 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               reason !== "issue_recovery_action_restored" ||
               opts.requestedByActorType !== "system" ||
               opts.requestedByActorId !== "execution-recovery" ||
-              opts.idempotencyKey !== `execution-reconciliation:${actionId}` ||
               enrichedContextSnapshot.source !== "execution.reconciled" ||
               enrichedContextSnapshot.forceFreshSession !== true ||
               payload?.issueId !== issue.id ||
@@ -3003,7 +3005,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             // The issue lock serializes all admissions for this source. Validate
             // the durable operator decision, then reconcile a prior queue commit
             // before considering a new wake (including a now-terminal successor).
-            const [action] = await tx
+            let [action] = await tx
               .select()
               .from(issueRecoveryActions)
               .where(
@@ -3038,46 +3040,59 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             )
               return { kind: "skipped" as const };
 
-            const [existingWake] = await tx
-              .select()
-              .from(agentWakeupRequests)
-              .where(
-                and(
-                  eq(agentWakeupRequests.companyId, issue.companyId),
-                  eq(agentWakeupRequests.agentId, agentId),
-                  eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey),
-                  ne(agentWakeupRequests.status, "skipped"),
-                ),
-              )
-              .orderBy(asc(agentWakeupRequests.requestedAt))
-              .limit(1);
+            const legacy = action.cause === "legacy_execution_requires_reconciliation";
+            const reconciliationKey = legacy
+              ? `execution-reconciliation:${issue.companyId}:${issue.id}:${sourceRunId}`
+              : `execution-reconciliation:${action.id}`;
+            if (opts.idempotencyKey !== reconciliationKey &&
+                (!legacy || opts.idempotencyKey !== `execution-reconciliation:${action.id}`)) {
+              return { kind: "skipped" as const };
+            }
+            if (legacy) {
+              // The same native resolution transaction consolidates historical
+              // action-ID intents before this queue can admit any successor.
+              action = await markExecutionReconciliation(tx as unknown as Db, action,
+                decision as unknown as ExecutionReconciliation, "execution-recovery");
+              actionId = action.id;
+              opts = { ...opts, idempotencyKey: reconciliationKey };
+              enrichedContextSnapshot.recoveryActionId = action.id;
+              payload = { ...payload, recoveryActionId: action.id, [DEFERRED_WAKE_CONTEXT_KEY]: enrichedContextSnapshot };
+            }
+            const siblingActionIds = legacy
+              ? parseObject(action.evidence.executionConsolidation).actionIds as string[]
+              : [action.id];
+
+            const [existingWake] = await tx.select().from(agentWakeupRequests).where(and(
+              eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
+              eq(agentWakeupRequests.idempotencyKey, reconciliationKey),
+              legacy ? undefined : ne(agentWakeupRequests.status, "skipped"),
+            )).orderBy(asc(agentWakeupRequests.requestedAt)).limit(1).for("update");
             if (existingWake) {
-              if (
-                existingWake.payload?.issueId !== issue.id ||
-                existingWake.payload?.recoveryActionId !== action.id ||
-                existingWake.requestedByActorType !== "system" ||
-                existingWake.requestedByActorId !== "execution-recovery" ||
-                !existingWake.runId
-              )
+              if (existingWake.payload?.issueId !== issue.id || existingWake.payload?.recoveryActionId !== action.id ||
+                  existingWake.requestedByActorType !== "system" || existingWake.requestedByActorId !== "execution-recovery") {
                 return { kind: "deferred" as const };
-              const [existingRun] = await tx
-                .select()
-                .from(heartbeatRuns)
-                .where(
-                  and(
-                    eq(heartbeatRuns.companyId, issue.companyId),
-                    eq(heartbeatRuns.agentId, agentId),
-                    eq(heartbeatRuns.id, existingWake.runId),
-                  ),
-                );
-              if (
-                !existingRun ||
-                existingRun.contextSnapshot?.issueId !== issue.id ||
-                existingRun.contextSnapshot?.recoveryActionId !== action.id ||
-                existingRun.contextSnapshot?.previousRunId !== sourceRunId
-              )
-                return { kind: "deferred" as const };
-              return { kind: "replayed" as const, run: existingRun };
+              }
+              if (!existingWake.runId) {
+                if (!legacy || !["queued", "skipped", "deferred_issue_execution"].includes(existingWake.status)) {
+                  return { kind: "deferred" as const };
+                }
+                // Reuse a pre-upgrade pending/skipped receipt, never append a
+                // second wake for the same reconciled source.
+                reconciledWakeRequestId = existingWake.id;
+                payload = { ...existingWake.payload, ...payload, executionWait: undefined,
+                  executionConsolidation: existingWake.payload?.executionConsolidation };
+              } else {
+                const [existingRun] = await tx.select().from(heartbeatRuns).where(and(
+                  eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, agentId),
+                  eq(heartbeatRuns.id, existingWake.runId),
+                ));
+                if (!existingRun || existingRun.contextSnapshot?.issueId !== issue.id ||
+                    !siblingActionIds.includes(String(existingRun.contextSnapshot?.recoveryActionId)) ||
+                    existingRun.contextSnapshot?.previousRunId !== sourceRunId) {
+                  return { kind: "deferred" as const };
+                }
+                return { kind: "replayed" as const, run: existingRun };
+              }
             }
             if (action.evidence.continuationDelivery !== "pending")
               return { kind: "skipped" as const };
@@ -3937,23 +3952,18 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             enrichedContextSnapshot.explicitUserContinuation = explicitContinuation;
           }
 
-          const wakeupRequest = await tx
-            .insert(agentWakeupRequests)
-            .values({
-              ...durableReceiptFields,
-              companyId: agent.companyId,
-              agentId,
-              source,
-              triggerDetail,
-              reason,
-              payload,
-              status: "queued",
-              requestedByActorType: opts.requestedByActorType ?? null,
-              requestedByActorId: opts.requestedByActorId ?? null,
-              idempotencyKey: opts.idempotencyKey ?? null,
-            })
-            .returning()
-            .then((rows) => rows[0]);
+          const wakeValues = {
+            ...durableReceiptFields,
+            companyId: agent.companyId, agentId, source, triggerDetail, reason, payload, status: "queued",
+            requestedByActorType: opts.requestedByActorType ?? null,
+            requestedByActorId: opts.requestedByActorId ?? null, idempotencyKey: opts.idempotencyKey ?? null,
+          };
+          const [wakeupRequest] = reconciledWakeRequestId
+            ? await tx.update(agentWakeupRequests).set({
+                ...wakeValues, finishedAt: null, error: null, updatedAt: new Date(),
+              }).where(and(eq(agentWakeupRequests.companyId, issue.companyId),
+                eq(agentWakeupRequests.id, reconciledWakeRequestId))).returning()
+            : await tx.insert(agentWakeupRequests).values(wakeValues).returning();
 
           // A handoff changes the executor, not the owner of saved user input.
           // Validate its exact stopped source while the issue row is locked;
