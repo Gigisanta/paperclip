@@ -1646,6 +1646,21 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
   async function releaseRunClaimedJustBeforeSuppression(runId: string) {
     const now = new Date();
     await db.transaction(async (tx) => {
+      // Admission, reconciliation, and claim release all lock the issue before
+      // its run or wake. Otherwise an acknowledgement holding the issue can
+      // deadlock with suppression release holding the just-claimed successor.
+      const [candidate] = await tx.select({
+        companyId: heartbeatRuns.companyId,
+        issueId: sql<string | null>`${heartbeatRuns.contextSnapshot}->>'issueId'`,
+      }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running"),
+      ));
+      if (!candidate) return;
+      const issueId = readNonEmptyString(candidate.issueId);
+      if (issueId) {
+        await tx.execute(sql`select id from issues
+          where id = ${issueId} and company_id = ${candidate.companyId} for update`);
+      }
       const released = await tx
         .update(heartbeatRuns)
         .set({
@@ -1655,7 +1670,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           updatedAt: now,
         })
         .where(
-          and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running")),
+          and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, candidate.companyId),
+            eq(heartbeatRuns.status, "running")),
         )
         .returning()
         .then((rows) => rows[0] ?? null);
@@ -1668,8 +1684,6 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           .where(and(eq(agentWakeupRequests.id, released.wakeupRequestId), ne(agentWakeupRequests.status, "cancelled")));
       }
 
-      const context = parseObject(released.contextSnapshot);
-      const issueId = readNonEmptyString(context.issueId);
       if (issueId) {
         await tx
           .update(issues)

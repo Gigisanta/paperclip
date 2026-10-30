@@ -36,7 +36,7 @@ import {
 import { errorHandler } from "../middleware/index.js";
 import { actorMiddleware } from "../middleware/auth.js";
 import { issueRoutes } from "../routes/issues.js";
-import { buildPaperclipWakePayload, heartbeatService } from "../services/heartbeat.js";
+import { buildPaperclipWakePayload, heartbeatService, startTaskDrain, stopTaskDrain, getTaskDrainStatus } from "../services/heartbeat.js";
 import { deliverReconciledExecutions } from "../services/execution-recovery-resolution.js";
 import { workspaceOperationService, isNativeWorkspaceFinalizationOperationActive } from "../services/workspace-operations.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
@@ -45,6 +45,7 @@ import { noticeMetadataReferencesRecoveryAction } from "../services/recovery/suc
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { logger } from "../middleware/logger.js";
 import { terminalizeLegacyExecution } from "../services/legacy-execution-recovery.js";
+import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 import { createLocalDiskStorageProvider } from "../storage/local-disk-provider.js";
 import { createStorageService } from "../storage/service.js";
 
@@ -1882,10 +1883,11 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
     // Occupy the agent's only dispatch slot, independently of this issue. These
     // tests exercise real wake admission, but cannot launch a provider process.
+    const occupiedRunId = randomUUID();
     await seedHeartbeatRun({
       companyId,
       agentId: coderId,
-      runId: randomUUID(),
+      runId: occupiedRunId,
       status: "running",
     });
     const [action] = await db
@@ -1916,6 +1918,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     return {
       ...fixture,
       previousRunId,
+      occupiedRunId,
       action: action!,
       heartbeat: heartbeatService(db, { runtimeEnv: {} }),
     };
@@ -2044,6 +2047,22 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(await getExecutionBlocker(db, f.companyId, f.sourceIssueId)).toBeNull();
   });
 
+  async function waitForBlockedBackend(blockers: number[], excluded: number[] = []) {
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      const [blocked] = await db.execute<{ pid: number }>(sql`
+        select activity.pid from pg_stat_activity activity
+        where activity.datname = current_database() and activity.pid <> pg_backend_pid()
+          and exists (select 1 from unnest(pg_blocking_pids(activity.pid)) blocker(pid)
+            where blocker.pid in (${sql.join(blockers.map(pid => sql`${pid}`), sql`, `)}))
+          and ${excluded.length ? sql`activity.pid not in (${sql.join(excluded.map(pid => sql`${pid}`), sql`, `)})` : sql`true`}
+        limit 1`);
+      if (blocked) return blocked.pid;
+      await delay(10);
+    }
+    throw new Error("The expected PostgreSQL row-lock waiter did not appear");
+  }
+
   it("serializes concurrent HTTP resolution and native admission acknowledgement without a row-lock inversion", async () => {
     const f = await seedDuplicateLegacyDelivery();
     const admitted = Promise.withResolvers<void>();
@@ -2060,21 +2079,6 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
     let holder: Promise<void> | undefined;
     let resolving: Promise<{ status: number; body: unknown }> | undefined;
-    const waitForBlockedBackend = async (blockers: number[], excluded: number[] = []) => {
-      const deadline = Date.now() + 5000;
-      while (Date.now() < deadline) {
-        const [blocked] = await db.execute<{ pid: number }>(sql`
-          select activity.pid from pg_stat_activity activity
-          where activity.datname = current_database() and activity.pid <> pg_backend_pid()
-            and exists (select 1 from unnest(pg_blocking_pids(activity.pid)) blocker(pid)
-              where blocker.pid in (${sql.join(blockers.map(pid => sql`${pid}`), sql`, `)}))
-            and ${excluded.length ? sql`activity.pid not in (${sql.join(excluded.map(pid => sql`${pid}`), sql`, `)})` : sql`true`}
-          limit 1`);
-        if (blocked) return blocked.pid;
-        await delay(10);
-      }
-      throw new Error("The expected PostgreSQL row-lock waiter did not appear");
-    };
     try {
       await Promise.race([admitted.promise, delivery.then(() => {
         throw new Error("Delivery finished before native admission");
@@ -2110,6 +2114,142 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       releaseAction.resolve();
       await Promise.allSettled([delivery, ...(holder ? [holder] : []), ...(resolving ? [resolving] : [])]);
       warnings.mockRestore();
+    }
+  }, 20_000);
+
+  it("serializes real task-drain claim release with reconciliation acknowledgement and repeated HTTP resolution", async () => {
+    const f = await seedDuplicateLegacyDelivery();
+    const admitted = Promise.withResolvers<string>();
+    const allowAcknowledgement = Promise.withResolvers<void>();
+    const actionHeld = Promise.withResolvers<number>();
+    const releaseAction = Promise.withResolvers<void>();
+    const claimHeld = Promise.withResolvers<number>();
+    const releaseClaim = Promise.withResolvers<void>();
+    const claimed = Promise.withResolvers<void>();
+    const claimBarrier = Number.parseInt(randomUUID().replaceAll("-", "").slice(0, 7), 16);
+    const nativeSessionBackendFactory = vi.fn(() => {
+      throw new Error("Task drain must precede the native provider handoff");
+    });
+    f.heartbeat = heartbeatService(db, { runtimeEnv: {}, nativeSessionBackendFactory });
+    await db.update(agents).set({
+      status: "active", adapterType: "paperclip_runner",
+      adapterConfig: { provider: "codex", model: "gpt-5.6-luna" },
+    }).where(eq(agents.id, f.coderId));
+    const warnings = vi.spyOn(logger, "warn");
+    const errors = vi.spyOn(logger, "error");
+    const delivery = deliverReconciledExecutions(db, async (...args) => {
+      const run = await f.heartbeat.wakeup(...args);
+      if (!run) throw new Error("The disposable successor was not admitted");
+      admitted.resolve(run.id);
+      await allowAcknowledgement.promise;
+      return run;
+    });
+    let actionHolder: Promise<void> | undefined;
+    let claimHolder: Promise<void> | undefined;
+    let dispatch: Promise<unknown> | undefined;
+    let resolving: Promise<{ status: number; body: unknown }> | undefined;
+    let unsubscribe = () => {};
+    try {
+      const successorId = await Promise.race([admitted.promise, delivery.then(() => {
+        throw new Error("Delivery finished before native admission");
+      })]);
+      const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, successorId));
+      expect(successor!.wakeupRequestId).toBeTruthy();
+      await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, f.occupiedRunId));
+      // Pause the final lazy issue stamp, not the earlier claim transaction:
+      // automation NOWAIT-locks the wake before publishing "running". The
+      // scoped trigger runs only after that wake has actually become claimed.
+      await db.execute(sql`create function recovery_test_pause_claim() returns trigger language plpgsql as $$
+        begin
+          if new.id = TG_ARGV[0]::uuid and new.execution_run_id = TG_ARGV[1]::uuid
+            and exists (select 1 from agent_wakeup_requests
+              where id = TG_ARGV[2]::uuid and status = 'claimed') then
+            perform pg_advisory_xact_lock(TG_ARGV[3]::bigint);
+          end if;
+          return new;
+        end;
+      $$`);
+      await db.execute(sql.raw(`create trigger recovery_test_pause_claim after update of execution_run_id
+        on issues for each row execute function recovery_test_pause_claim(
+          '${f.sourceIssueId}', '${successorId}', '${successor!.wakeupRequestId}', '${claimBarrier}')`));
+      claimHolder = db.transaction(async tx => {
+        await tx.execute(sql`select pg_advisory_xact_lock(${claimBarrier}::bigint)`);
+        const [backend] = await tx.execute<{ pid: number }>(sql`select pg_backend_pid() as pid`);
+        claimHeld.resolve(backend.pid);
+        await releaseClaim.promise;
+      });
+      const claimGatePid = await claimHeld.promise;
+      unsubscribe = subscribeCompanyLiveEvents(f.companyId, event => {
+        const payload = event.payload as { runId?: string; status?: string };
+        if (event.type === "heartbeat.run.status" && payload.runId === successorId && payload.status === "running") {
+          startTaskDrain({});
+          claimed.resolve();
+        }
+      });
+      dispatch = f.heartbeat.resumeQueuedRunsForAgent(f.companyId, f.coderId);
+      await Promise.race([claimed.promise, dispatch.then(() => {
+        throw new Error("Native dispatch finished before claiming the successor");
+      })]);
+      const claimStampPid = await waitForBlockedBackend([claimGatePid]);
+      actionHolder = db.transaction(async tx => {
+        await tx.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions)
+          .where(eq(issueRecoveryActions.id, f.action.id)).for("update");
+        const [backend] = await tx.execute<{ pid: number }>(sql`select pg_backend_pid() as pid`);
+        actionHeld.resolve(backend.pid);
+        await releaseAction.promise;
+      });
+      const holderPid = await actionHeld.promise;
+      allowAcknowledgement.resolve();
+      const acknowledgementPid = await waitForBlockedBackend([claimStampPid]);
+      releaseClaim.resolve();
+      await claimHolder;
+      await waitForBlockedBackend([holderPid]);
+      await dispatch;
+      // Suppression release is now waiting on acknowledgement's issue lock.
+      // The old release already held the successor here, creating a cycle as
+      // soon as acknowledgement advanced past the action-row barrier.
+      await waitForBlockedBackend([acknowledgementPid]);
+      resolving = request(createApp()).post(`/api/issues/${f.sourceIssueId}/recovery-actions/resolve`)
+        .send(f.body).then(response => ({ status: response.status, body: response.body }));
+      releaseAction.resolve();
+      await actionHolder;
+      await delivery;
+      await f.heartbeat.drainActiveRunExecutions();
+      expect(nativeSessionBackendFactory).not.toHaveBeenCalled();
+      const response = await resolving;
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect(errors).not.toHaveBeenCalled();
+      expect(warnings).not.toHaveBeenCalledWith(
+        expect.objectContaining({ recoveryActionId: f.action.id }),
+        "Reconciled execution continuation remains pending for retry",
+      );
+      const [released] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, successorId));
+      expect(released).toMatchObject({
+        status: "queued", startedAt: null, responsibleUserId: null, retryOfRunId: f.previousRunId,
+      });
+      const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, successor!.wakeupRequestId!));
+      expect(wake).toMatchObject({ status: "queued", claimedAt: null });
+      const [issue] = await db.select().from(issues).where(eq(issues.id, f.sourceIssueId));
+      expect(issue).toMatchObject({ executionRunId: null, executionAgentNameKey: null, executionLockedAt: null });
+      const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.action.id));
+      expect(action!.evidence).toMatchObject({ continuationDelivery: "delivered", continuationRunId: successorId });
+      await deliverReconciledExecutions(db, f.heartbeat.wakeup);
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, f.previousRunId))).toHaveLength(1);
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toHaveLength(1);
+      expect(getTaskDrainStatus()).toMatchObject({ draining: true, quiescent: true });
+      expect(await getExecutionBlocker(db, f.companyId, f.sourceIssueId)).toBeNull();
+    } finally {
+      allowAcknowledgement.resolve();
+      releaseAction.resolve();
+      releaseClaim.resolve();
+      await Promise.allSettled([delivery, ...[actionHolder, claimHolder, dispatch, resolving].filter(p => p !== undefined)]);
+      await f.heartbeat.drainActiveRunExecutions();
+      unsubscribe();
+      stopTaskDrain();
+      await db.execute(sql`drop trigger if exists recovery_test_pause_claim on issues`);
+      await db.execute(sql`drop function if exists recovery_test_pause_claim()`);
+      warnings.mockRestore();
+      errors.mockRestore();
     }
   }, 20_000);
 
