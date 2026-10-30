@@ -638,6 +638,8 @@ An existing reconciliation intent becomes canonical. Superseded siblings remain 
 
 Legacy reconciliation delivery uses `execution-reconciliation:<companyId>:<issueId>:<sourceRunId>`, not an action-ID key. Existing action-ID pending or skipped wake receipts are adopted, and redundant receipts are retained as superseded rather than dispatched. An already-admitted successor is adopted even after it finishes, with `retryOfRunId` identifying the source. Repeated or concurrent resolutions and delivery sweeps cannot admit a second successor for that source. Later terminalization preserves an existing resolved no-replay action instead of opening a duplicate incident.
 
+Delivery acknowledgement takes the same issue, recovery-action, then successor lock order as resolution and admission. Adopting an existing successor validates the stopped source and recorded decision independently of permission to start a new turn: repeating the decision after the issue becomes `done` or `cancelled` must preserve that terminal state and cannot request another wake. A retained workspace repair remains evidence-only and records `continuationDelivery: not_requested`.
+
 This is consolidation of one observed execution decision, not permission to retry unknown effects. Other source runs, owners, workspace holds, and ordinary dispatch gates remain independent. No separate endpoint or UI Retry action is required.
 
 ### Agent-assigned `todo`

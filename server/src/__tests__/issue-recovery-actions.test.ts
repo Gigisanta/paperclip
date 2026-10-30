@@ -3,6 +3,7 @@ import { once } from "node:events";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import express from "express";
 import request from "supertest";
 import { and, eq, sql } from "drizzle-orm";
@@ -42,6 +43,7 @@ import { issueRecoveryActionService } from "../services/issue-recovery-actions.j
 import { recoveryService } from "../services/recovery/service.js";
 import { noticeMetadataReferencesRecoveryAction } from "../services/recovery/successful-run-handoff.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { logger } from "../middleware/logger.js";
 import { terminalizeLegacyExecution } from "../services/legacy-execution-recovery.js";
 import { createLocalDiskStorageProvider } from "../storage/local-disk-provider.js";
 import { createStorageService } from "../storage/service.js";
@@ -1941,7 +1943,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         executionReconciliation: canonical!.evidence.executionReconciliation } };
   }
 
-  it.each(["skipped", "skipped_source_key", "pending", "duplicate_wakes", "active_sibling", "finished_successor", "context_successor"] as const)(
+  it.each(["skipped", "skipped_source_key", "pending", "duplicate_wakes", "active_sibling",
+    "finished_successor", "context_successor", "completed_issue", "cancelled_issue"] as const)(
     "consolidates same-run legacy holds through HTTP and delivers one successor (%s)",
     async (migration) => {
       const f = await seedDuplicateLegacyDelivery();
@@ -1952,7 +1955,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         await db.update(issueRecoveryActions).set({ status: "active", outcome: null, resolvedAt: null })
           .where(eq(issueRecoveryActions.id, f.blocked.id));
       }
-      if (migration === "finished_successor" || migration === "context_successor") {
+      const terminalStatus = migration === "completed_issue" ? "done" : migration === "cancelled_issue" ? "cancelled" : null;
+      if (migration === "finished_successor" || migration === "context_successor" || terminalStatus) {
         const [run] = await db.insert(heartbeatRuns).values({
           companyId: f.companyId, agentId: f.coderId, status: "succeeded",
           retryOfRunId: migration === "context_successor" ? null : f.previousRunId,
@@ -1960,6 +1964,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
             previousRunId: f.previousRunId, retryOfRunId: f.previousRunId, source: "execution.reconciled" },
         }).returning();
         admittedRunId = run!.id;
+        if (terminalStatus) await db.update(issues).set({ status: terminalStatus }).where(eq(issues.id, f.sourceIssueId));
       }
       const [oldWake] = await db.insert(agentWakeupRequests).values({
         companyId: f.companyId, agentId: f.coderId, source: "automation", triggerDetail: "system",
@@ -1986,6 +1991,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       const responses = await Promise.all([f.action.id, f.blocked.id].map(actionId =>
         request(app).post(`/api/issues/${f.sourceIssueId}/recovery-actions/resolve`).send({ ...f.body, actionId })));
       for (const response of responses) expect(response.status, JSON.stringify(response.body)).toBe(200);
+      if (terminalStatus) for (const response of responses) expect(response.body.issue.status).toBe(terminalStatus);
       expect(await getExecutionBlocker(db, f.companyId, f.sourceIssueId)).toBeNull();
       await Promise.all([1, 2].map(() => deliverReconciledExecutions(db, f.heartbeat.wakeup)));
       await request(app).post(`/api/issues/${f.sourceIssueId}/recovery-actions/resolve`).send(f.body).expect(200);
@@ -2016,6 +2022,96 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.sourceIssueId))).toHaveLength(2);
     },
   );
+
+  it.each(["done", "cancelled"] as const)("adopts an unacknowledged successor after the issue becomes %s", async status => {
+    const f = await seedDuplicateLegacyDelivery();
+    const [successor] = await db.insert(heartbeatRuns).values({
+      companyId: f.companyId, agentId: f.coderId, status: "succeeded", retryOfRunId: f.previousRunId,
+      contextSnapshot: { issueId: f.sourceIssueId, recoveryActionId: f.action.id,
+        previousRunId: f.previousRunId, source: "execution.reconciled" },
+    }).returning();
+    await db.update(issues).set({ status }).where(eq(issues.id, f.sourceIssueId));
+    const wake = vi.fn(f.heartbeat.wakeup);
+    await deliverReconciledExecutions(db, wake);
+    expect(wake).not.toHaveBeenCalled();
+    const response = await request(createApp()).post(`/api/issues/${f.sourceIssueId}/recovery-actions/resolve`)
+      .send(f.body).expect(200);
+    expect(response.body).toMatchObject({ issue: { status }, recoveryAction: { evidence: {
+      continuationDelivery: "delivered", continuationRunId: successor!.id,
+    } } });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, f.previousRunId))).toHaveLength(1);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toHaveLength(0);
+    expect(await getExecutionBlocker(db, f.companyId, f.sourceIssueId)).toBeNull();
+  });
+
+  it("serializes concurrent HTTP resolution and native admission acknowledgement without a row-lock inversion", async () => {
+    const f = await seedDuplicateLegacyDelivery();
+    const admitted = Promise.withResolvers<void>();
+    const allowAcknowledgement = Promise.withResolvers<void>();
+    const actionHeld = Promise.withResolvers<number>();
+    const releaseAction = Promise.withResolvers<void>();
+    const warnings = vi.spyOn(logger, "warn");
+    const delivery = deliverReconciledExecutions(db, async (...args) => {
+      const run = await f.heartbeat.wakeup(...args);
+      if (!run) throw new Error("The disposable successor was not admitted");
+      admitted.resolve();
+      await allowAcknowledgement.promise;
+      return run;
+    });
+    let holder: Promise<void> | undefined;
+    let resolving: Promise<{ status: number; body: unknown }> | undefined;
+    const waitForBlockedBackend = async (blockers: number[], excluded: number[] = []) => {
+      const deadline = Date.now() + 5000;
+      while (Date.now() < deadline) {
+        const [blocked] = await db.execute<{ pid: number }>(sql`
+          select activity.pid from pg_stat_activity activity
+          where activity.datname = current_database() and activity.pid <> pg_backend_pid()
+            and exists (select 1 from unnest(pg_blocking_pids(activity.pid)) blocker(pid)
+              where blocker.pid in (${sql.join(blockers.map(pid => sql`${pid}`), sql`, `)}))
+            and ${excluded.length ? sql`activity.pid not in (${sql.join(excluded.map(pid => sql`${pid}`), sql`, `)})` : sql`true`}
+          limit 1`);
+        if (blocked) return blocked.pid;
+        await delay(10);
+      }
+      throw new Error("The expected PostgreSQL row-lock waiter did not appear");
+    };
+    try {
+      await Promise.race([admitted.promise, delivery.then(() => {
+        throw new Error("Delivery finished before native admission");
+      })]);
+      // Hold only the action in a test transaction. The resolver must acquire
+      // the issue first, then wait here; acknowledgement must queue behind it.
+      holder = db.transaction(async tx => {
+        await tx.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions)
+          .where(eq(issueRecoveryActions.id, f.action.id)).for("update");
+        const [backend] = await tx.execute<{ pid: number }>(sql`select pg_backend_pid() as pid`);
+        actionHeld.resolve(backend.pid);
+        await releaseAction.promise;
+      });
+      const holderPid = await actionHeld.promise;
+      resolving = request(createApp()).post(`/api/issues/${f.sourceIssueId}/recovery-actions/resolve`)
+        .send(f.body).then(response => ({ status: response.status, body: response.body }));
+      const resolverPid = await waitForBlockedBackend([holderPid]);
+      allowAcknowledgement.resolve();
+      await waitForBlockedBackend([holderPid, resolverPid], [resolverPid]);
+      releaseAction.resolve();
+      await holder;
+      const response = await resolving;
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      await delivery;
+      expect(warnings).not.toHaveBeenCalledWith(
+        expect.objectContaining({ recoveryActionId: f.action.id }),
+        "Reconciled execution continuation remains pending for retry",
+      );
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, f.previousRunId))).toHaveLength(1);
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toHaveLength(1);
+    } finally {
+      allowAcknowledgement.resolve();
+      releaseAction.resolve();
+      await Promise.allSettled([delivery, ...(holder ? [holder] : []), ...(resolving ? [resolving] : [])]);
+      warnings.mockRestore();
+    }
+  }, 20_000);
 
   it.each(["owner", "delivery_owner", "decision", "run_scope", "company_scope"] as const)(
     "rejects conflicting legacy consolidation evidence (%s)", async (conflict) => {

@@ -121,7 +121,8 @@ async function consolidateLegacyReconciliation(
     throw conflict("The recorded recovery successor does not match the admitted source-run continuation.");
   }
   if (!successor && ["done", "cancelled"].includes(task.status)) throw conflict("The recovery task is no longer actionable.");
-  const source = await validateExecutionReconciliation({ db, companyId: task.companyId, issueId: task.id,
+  const validateSource = successor ? validateExecutionReconciliationSource : validateExecutionReconciliation;
+  const source = await validateSource({ db, companyId: task.companyId, issueId: task.id,
     agentId: task.assigneeAgentId, sourceRunId: decision.runId, decision });
   if ((source.nativeIssueId != null && source.nativeIssueId !== task.id) ||
       (source.contextSnapshot?.issueId !== undefined && source.contextSnapshot.issueId !== task.id)) {
@@ -198,8 +199,8 @@ async function consolidateLegacyReconciliation(
     ...(successor ? { continuationRunId: successor.id } : {}) } };
 }
 
-/** An operator records observed outcomes; this is not permission to blindly retry. */
-export async function validateExecutionReconciliation(input: {
+/** Verify source evidence independently of permission to start another turn. */
+async function validateExecutionReconciliationSource(input: {
   db: Db;
   companyId: string;
   issueId: string;
@@ -328,11 +329,17 @@ export async function validateExecutionReconciliation(input: {
     throw conflict(
       "The previous execution environment has not finished releasing its authority.",
     );
-  if (!repairOnly) await buildExecutionContinuation({
-    db,
-    companyId,
-    issueId,
-    agentId: agentId!,
+  return run;
+}
+
+/** An operator records observed outcomes; this is not permission to blindly retry. */
+export async function validateExecutionReconciliation(input: Parameters<typeof validateExecutionReconciliationSource>[0]) {
+  const run = await validateExecutionReconciliationSource(input);
+  if (!input.workspaceRepairOnly) await buildExecutionContinuation({
+    db: input.db,
+    companyId: input.companyId,
+    issueId: input.issueId,
+    agentId: input.agentId!,
     context: { previousRunId: run.id },
     summary: null,
     exposeLowTrustRaw: false,
@@ -424,6 +431,7 @@ export async function deliverReconciledExecutions(
       const pendingDecision = and(
         eq(issueRecoveryActions.companyId, action.companyId),
         eq(issueRecoveryActions.id, action.id),
+        eq(issueRecoveryActions.sourceIssueId, action.sourceIssueId),
         eq(issueRecoveryActions.status, "resolved"),
         sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'pending'`,
         sql`${issueRecoveryActions.evidence}->'executionReconciliation' = ${JSON.stringify(decision)}::jsonb`,
@@ -437,6 +445,18 @@ export async function deliverReconciledExecutions(
             eq(issues.id, action.sourceIssueId),
           ),
         );
+      if (task && task.assigneeAgentId === action.returnOwnerAgentId &&
+          ["done", "cancelled"].includes(task.status) && action.cause === "legacy_execution_requires_reconciliation") {
+        const [successor] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(or(
+          eq(heartbeatRuns.retryOfRunId, decision.runId), and(
+            sql`${heartbeatRuns.contextSnapshot}->>'previousRunId' = ${decision.runId}`,
+            sql`${heartbeatRuns.contextSnapshot}->>'source' = 'execution.reconciled'`),
+        )).limit(1);
+        if (successor) {
+          await markExecutionReconciliation(db, action, decision, "execution-recovery");
+          continue;
+        }
+      }
       if (
         !task ||
         task.assigneeAgentId !== action.returnOwnerAgentId ||
@@ -473,6 +493,15 @@ export async function deliverReconciledExecutions(
       });
       if (run)
         await db.transaction(async (tx) => {
+          // Resolve, admission and acknowledgement all take issue -> action ->
+          // successor locks. An acknowledgement must not invert that order.
+          const [lockedTask] = await tx.select({ id: issues.id }).from(issues).where(and(
+            eq(issues.companyId, action.companyId), eq(issues.id, action.sourceIssueId),
+          )).for("update");
+          if (!lockedTask) return;
+          const [lockedAction] = await tx.select({ id: issueRecoveryActions.id })
+            .from(issueRecoveryActions).where(pendingDecision).for("update");
+          if (!lockedAction) return;
           await tx
             .update(heartbeatRuns)
             .set({ retryOfRunId: decision.runId })
